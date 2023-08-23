@@ -16,7 +16,7 @@ from detectron2.engine import DefaultTrainer, launch
 from detectron2.evaluation import COCOEvaluator, DatasetEvaluators, verify_results
 
 # DETR imports
-from d2.train_net import Trainer as Detr_Trainer
+# from d2.train_net import Trainer as Detr_Trainer
 
 # Project imports
 from core.setup import setup_config, setup_arg_parser
@@ -78,10 +78,10 @@ def main(args):
 
     # Eval only mode to produce mAP results
     # Build Trainer from config node. Begin Training.
-    if cfg.MODEL.META_ARCHITECTURE == 'ProbabilisticDetr':
-        trainer = Detr_Trainer(cfg)
-    else:
-        trainer = Trainer(cfg)
+    # if cfg.MODEL.META_ARCHITECTURE == 'ProbabilisticDetr':
+    #     trainer = Detr_Trainer(cfg)
+    # else:
+    trainer = Trainer(cfg)
 
     if args.eval_only:
         model = trainer.build_model(cfg)
@@ -103,6 +103,12 @@ if __name__ == "__main__":
 
     args = arg_parser.parse_args()
     print("Command Line Args:", args)
+
+    args.num_gpus=1
+    args.dataset_dir='/home/marc/Downloads/COCO_data'
+    args.config_file='/home/marc/Documents/trailab_work/uda_detect/probdet/src/configs/COCO-Detection/faster-rcnn/faster_rcnn_R_50_FPN_3x_reg_var_es.yaml'
+    args.random_seed=1000
+    args.resume=False
 
     launch(
         main,

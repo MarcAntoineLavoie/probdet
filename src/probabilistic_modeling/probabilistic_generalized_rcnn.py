@@ -406,12 +406,20 @@ class ProbabilisticFastRCNNOutputLayers(nn.Module):
             nn.init.constant_(self.cls_var.bias, 0)
 
         if self.compute_bbox_cov:
-            self.bbox_cov = Linear(
-                input_size,
-                num_bbox_reg_classes *
-                bbox_cov_dims)
-            nn.init.normal_(self.bbox_cov.weight, std=0.0001)
-            nn.init.constant_(self.bbox_cov.bias, 0)
+            if bbox_cov_loss == 'samplenet':
+                self.bbox_cov = Linear(
+                    input_size,
+                    num_bbox_reg_classes *
+                    bbox_cov_dims * bbox_cov_num_samples)
+                nn.init.normal_(self.bbox_cov.weight, std=0.0001)
+                nn.init.constant_(self.bbox_cov.bias, 0)
+            else:
+                self.bbox_cov = Linear(
+                    input_size,
+                    num_bbox_reg_classes *
+                    bbox_cov_dims)
+                nn.init.normal_(self.bbox_cov.weight, std=0.0001)
+                nn.init.constant_(self.bbox_cov.bias, 0)
 
         self.box2box_transform = box2box_transform
         self.smooth_l1_beta = smooth_l1_beta
@@ -476,6 +484,9 @@ class ProbabilisticFastRCNNOutputLayers(nn.Module):
         # Compute box covariance if needed
         if self.compute_bbox_cov:
             proposal_covs = self.bbox_cov(x)
+            if self.bbox_cov_loss == 'samplenet':
+                proposal_covs = proposal_covs.reshape(proposal_covs.shape[0], -1, 320)
+                proposal_deltas = proposal_covs.mean(axis=1)
         else:
             proposal_covs = None
 
@@ -668,84 +679,7 @@ class ProbabilisticFastRCNNOutputLayers(nn.Module):
             gt_proposals_delta = gt_proposal_deltas[fg_inds]
 
             if self.compute_bbox_cov:
-                pred_proposal_covs = pred_proposal_covs[fg_inds[:,
-                                                                None], gt_covar_class_cols]
-                pred_proposal_covs = clamp_log_variance(pred_proposal_covs)
-
-                if self.bbox_cov_loss == 'negative_log_likelihood':
-                    if self.bbox_cov_type == 'diagonal':
-                        # Ger foreground proposals.
-                        _proposals_boxes = proposals_boxes.tensor[fg_inds]
-
-                        # Compute regression negative log likelihood loss according to:
-                        # "What Uncertainties Do We Need in Bayesian Deep Learning for Computer Vision?", NIPS 2017
-                        loss_box_reg = 0.5 * torch.exp(-pred_proposal_covs) * smooth_l1_loss(
-                            pred_proposal_deltas, gt_proposals_delta, beta=self.smooth_l1_beta)
-                        loss_covariance_regularize = 0.5 * pred_proposal_covs
-                        loss_box_reg += loss_covariance_regularize
-
-                        loss_box_reg = torch.sum(
-                            loss_box_reg) / loss_reg_normalizer
-                    else:
-                        # Multivariate Gaussian Negative Log Likelihood loss using pytorch
-                        # distributions.multivariate_normal.log_prob()
-                        forecaster_cholesky = covariance_output_to_cholesky(
-                            pred_proposal_covs)
-
-                        multivariate_normal_dists = distributions.multivariate_normal.MultivariateNormal(
-                            pred_proposal_deltas, scale_tril=forecaster_cholesky)
-
-                        loss_box_reg = - \
-                            multivariate_normal_dists.log_prob(gt_proposals_delta)
-                        loss_box_reg = torch.sum(
-                            loss_box_reg) / loss_reg_normalizer
-
-                elif self.bbox_cov_loss == 'second_moment_matching':
-                    # Compute regression covariance using second moment
-                    # matching.
-                    loss_box_reg = smooth_l1_loss(pred_proposal_deltas,
-                                                  gt_proposals_delta,
-                                                  self.smooth_l1_beta)
-                    errors = (pred_proposal_deltas - gt_proposals_delta)
-                    if self.bbox_cov_type == 'diagonal':
-                        # Handel diagonal case
-                        second_moment_matching_term = smooth_l1_loss(
-                            torch.exp(pred_proposal_covs), errors ** 2, beta=self.smooth_l1_beta)
-                        loss_box_reg += second_moment_matching_term
-                        loss_box_reg = torch.sum(
-                            loss_box_reg) / loss_reg_normalizer
-                    else:
-                        # Handel full covariance case
-                        errors = torch.unsqueeze(errors, 2)
-                        gt_error_covar = torch.matmul(
-                            errors, torch.transpose(errors, 2, 1))
-
-                        # This is the cholesky decomposition of the covariance matrix.
-                        # We reconstruct it from 10 estimated parameters as a
-                        # lower triangular matrix.
-                        forecaster_cholesky = covariance_output_to_cholesky(
-                            pred_proposal_covs)
-
-                        predicted_covar = torch.matmul(
-                            forecaster_cholesky, torch.transpose(
-                                forecaster_cholesky, 2, 1))
-
-                        second_moment_matching_term = smooth_l1_loss(
-                            predicted_covar, gt_error_covar, beta=self.smooth_l1_beta, reduction='sum')
-                        loss_box_reg = (
-                            torch.sum(loss_box_reg) + second_moment_matching_term) / loss_reg_normalizer
-
-                elif self.bbox_cov_loss == 'energy_loss':
-                    forecaster_cholesky = covariance_output_to_cholesky(
-                        pred_proposal_covs)
-
-                    # Define per-anchor Distributions
-                    multivariate_normal_dists = distributions.multivariate_normal.MultivariateNormal(
-                        pred_proposal_deltas, scale_tril=forecaster_cholesky)
-                    # Define Monte-Carlo Samples
-                    distributions_samples = multivariate_normal_dists.rsample(
-                        (self.bbox_cov_num_samples + 1,))
-
+                if self.bbox_cov_loss == 'samplenet':
                     distributions_samples_1 = distributions_samples[0:self.bbox_cov_num_samples, :, :]
                     distributions_samples_2 = distributions_samples[1:
                                                                     self.bbox_cov_num_samples + 1, :, :]
@@ -769,10 +703,114 @@ class ProbabilisticFastRCNNOutputLayers(nn.Module):
                     # Final Loss
                     loss_box_reg = (
                         loss_first_moment_match + loss_covariance_regularize) / loss_reg_normalizer
+                    
                 else:
-                    raise ValueError(
-                        'Invalid regression loss name {}.'.format(
-                            self.bbox_cov_loss))
+                    pred_proposal_covs = pred_proposal_covs[fg_inds[:,
+                                                                    None], gt_covar_class_cols]
+                    pred_proposal_covs = clamp_log_variance(pred_proposal_covs)
+
+                    if self.bbox_cov_loss == 'negative_log_likelihood':
+                        if self.bbox_cov_type == 'diagonal':
+                            # Ger foreground proposals.
+                            _proposals_boxes = proposals_boxes.tensor[fg_inds]
+
+                            # Compute regression negative log likelihood loss according to:
+                            # "What Uncertainties Do We Need in Bayesian Deep Learning for Computer Vision?", NIPS 2017
+                            loss_box_reg = 0.5 * torch.exp(-pred_proposal_covs) * smooth_l1_loss(
+                                pred_proposal_deltas, gt_proposals_delta, beta=self.smooth_l1_beta)
+                            loss_covariance_regularize = 0.5 * pred_proposal_covs
+                            loss_box_reg += loss_covariance_regularize
+
+                            loss_box_reg = torch.sum(
+                                loss_box_reg) / loss_reg_normalizer
+                        else:
+                            # Multivariate Gaussian Negative Log Likelihood loss using pytorch
+                            # distributions.multivariate_normal.log_prob()
+                            forecaster_cholesky = covariance_output_to_cholesky(
+                                pred_proposal_covs)
+
+                            multivariate_normal_dists = distributions.multivariate_normal.MultivariateNormal(
+                                pred_proposal_deltas, scale_tril=forecaster_cholesky)
+
+                            loss_box_reg = - \
+                                multivariate_normal_dists.log_prob(gt_proposals_delta)
+                            loss_box_reg = torch.sum(
+                                loss_box_reg) / loss_reg_normalizer
+
+                    elif self.bbox_cov_loss == 'second_moment_matching':
+                        # Compute regression covariance using second moment
+                        # matching.
+                        loss_box_reg = smooth_l1_loss(pred_proposal_deltas,
+                                                    gt_proposals_delta,
+                                                    self.smooth_l1_beta)
+                        errors = (pred_proposal_deltas - gt_proposals_delta)
+                        if self.bbox_cov_type == 'diagonal':
+                            # Handel diagonal case
+                            second_moment_matching_term = smooth_l1_loss(
+                                torch.exp(pred_proposal_covs), errors ** 2, beta=self.smooth_l1_beta)
+                            loss_box_reg += second_moment_matching_term
+                            loss_box_reg = torch.sum(
+                                loss_box_reg) / loss_reg_normalizer
+                        else:
+                            # Handel full covariance case
+                            errors = torch.unsqueeze(errors, 2)
+                            gt_error_covar = torch.matmul(
+                                errors, torch.transpose(errors, 2, 1))
+
+                            # This is the cholesky decomposition of the covariance matrix.
+                            # We reconstruct it from 10 estimated parameters as a
+                            # lower triangular matrix.
+                            forecaster_cholesky = covariance_output_to_cholesky(
+                                pred_proposal_covs)
+
+                            predicted_covar = torch.matmul(
+                                forecaster_cholesky, torch.transpose(
+                                    forecaster_cholesky, 2, 1))
+
+                            second_moment_matching_term = smooth_l1_loss(
+                                predicted_covar, gt_error_covar, beta=self.smooth_l1_beta, reduction='sum')
+                            loss_box_reg = (
+                                torch.sum(loss_box_reg) + second_moment_matching_term) / loss_reg_normalizer
+
+                    elif self.bbox_cov_loss == 'energy_loss':
+                        forecaster_cholesky = covariance_output_to_cholesky(
+                            pred_proposal_covs)
+
+                        # Define per-anchor Distributions
+                        multivariate_normal_dists = distributions.multivariate_normal.MultivariateNormal(
+                            pred_proposal_deltas, scale_tril=forecaster_cholesky)
+                        # Define Monte-Carlo Samples
+                        distributions_samples = multivariate_normal_dists.rsample(
+                            (self.bbox_cov_num_samples + 1,))
+
+                        distributions_samples_1 = distributions_samples[0:self.bbox_cov_num_samples, :, :]
+                        distributions_samples_2 = distributions_samples[1:
+                                                                        self.bbox_cov_num_samples + 1, :, :]
+
+                        # Compute energy score
+                        loss_covariance_regularize = - smooth_l1_loss(
+                            distributions_samples_1,
+                            distributions_samples_2,
+                            beta=self.smooth_l1_beta,
+                            reduction="sum") / self.bbox_cov_num_samples   # Second term
+
+                        gt_proposals_delta_samples = torch.repeat_interleave(
+                            gt_proposals_delta.unsqueeze(0), self.bbox_cov_num_samples, dim=0)
+
+                        loss_first_moment_match = 2.0 * smooth_l1_loss(
+                            distributions_samples_1,
+                            gt_proposals_delta_samples,
+                            beta=self.smooth_l1_beta,
+                            reduction="sum") / self.bbox_cov_num_samples  # First term
+
+                        # Final Loss
+                        loss_box_reg = (
+                            loss_first_moment_match + loss_covariance_regularize) / loss_reg_normalizer
+
+                    else:
+                        raise ValueError(
+                            'Invalid regression loss name {}.'.format(
+                                self.bbox_cov_loss))
 
                 # Perform loss annealing. Not really essential in Generalized-RCNN case, but good practice for more
                 # elaborate regression variance losses.
